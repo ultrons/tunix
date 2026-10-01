@@ -106,6 +106,17 @@ export PROFILER_PERIOD=${PROFILER_PERIOD:-}
 export ROLLOUT_FREE_KV_CACHE=${ROLLOUT_FREE_KV_CACHE:-false}
 export PARTIAL_ROLLOUT=${PARTIAL_ROLLOUT:-false}
 
+# JAX compilation cache configuration
+export LOCAL_JAX_CACHE_DIR=${LOCAL_JAX_CACHE_DIR:-${JAX_CACHE_DIR:-/tmp/jax_cache}}
+export JAX_CACHE_GCS_DIR=${JAX_CACHE_GCS_DIR:-}
+export ROLLOUT_JAX_CACHE_GCS_DIR=${ROLLOUT_JAX_CACHE_GCS_DIR:-${JAX_CACHE_GCS_DIR:+${JAX_CACHE_GCS_DIR}/rollout}}
+export TRAINER_JAX_CACHE_GCS_DIR=${TRAINER_JAX_CACHE_GCS_DIR:-${JAX_CACHE_GCS_DIR:+${JAX_CACHE_GCS_DIR}/trainer}}
+export EVAL_JAX_CACHE_GCS_DIR=${EVAL_JAX_CACHE_GCS_DIR:-${ROLLOUT_JAX_CACHE_GCS_DIR}}
+export SAVE_JAX_CACHE=${SAVE_JAX_CACHE:-false}
+export SKIP_JAX_PRECOMPILE=${SKIP_JAX_PRECOMPILE:-1}
+export VLLM_DISABLE_COMPILE_CACHE=${VLLM_DISABLE_COMPILE_CACHE:-0}
+export VLLM_XLA_CHECK_RECOMPILATION=${VLLM_XLA_CHECK_RECOMPILATION:-1}
+
 # DeepSWE dataset and environment configuration
 export DATASET_NAME=${DATASET_NAME:-R2E-Gym/R2E-Gym-Subset}
 export DATASET_PATH=${DATASET_PATH:-}
@@ -272,6 +283,32 @@ apply_manifest() {
   else
     "${filter[@]}" | kubectl apply -f -
   fi
+}
+
+build_jax_cache_cmd() {
+  local gcs_uri="$1"
+  local local_dir="${LOCAL_JAX_CACHE_DIR:-${JAX_CACHE_DIR:-/tmp/jax_cache}}"
+  local save_cache="${SAVE_JAX_CACHE:-false}"
+
+  if [[ "${DISABLE_JAX_CACHE:-0}" == "1" || "${DISABLE_JAX_CACHE:-false}" == "true" ]]; then
+    return 0
+  fi
+
+  local cmd=""
+  # 1. Restore compilation cache from GCS if specified
+  if [[ -n "${gcs_uri}" ]]; then
+    cmd+="mkdir -p \"${local_dir}\" && { if command -v gcloud &>/dev/null; then echo \"[jax_cache] Restoring compilation cache from ${gcs_uri}...\"; gcloud storage rsync -r \"${gcs_uri}\" \"${local_dir}\" || true; elif command -v gsutil &>/dev/null; then echo \"[jax_cache] Restoring compilation cache from ${gcs_uri}...\"; gsutil -m rsync -r \"${gcs_uri}\" \"${local_dir}\" || true; fi; }; "
+  fi
+
+  # 2. Register post-execution sync back to GCS on exit if save is enabled
+  if [[ "${save_cache}" == "true" && -n "${gcs_uri}" ]]; then
+    cmd+="trap 'if [ -d \"${local_dir}\" ]; then if command -v gcloud &>/dev/null; then echo \"[jax_cache] Uploading compilation cache to ${gcs_uri}...\"; gcloud storage rsync -r \"${local_dir}\" \"${gcs_uri}\" || true; elif command -v gsutil &>/dev/null; then echo \"[jax_cache] Uploading compilation cache to ${gcs_uri}...\"; gsutil -m rsync -r \"${local_dir}\" \"${gcs_uri}\" || true; fi; fi' EXIT; "
+  fi
+
+  # 3. Export caching environment flags for JAX and vLLM
+  cmd+="export JAX_COMPILATION_CACHE_DIR=\"${local_dir}\" VLLM_XLA_CACHE_PATH=\"${local_dir}\" VLLM_DISABLE_COMPILE_CACHE=0 VLLM_XLA_CHECK_RECOMPILATION=1; "
+
+  echo "${cmd}"
 }
 
 if [[ "$BETA" != "0" && "$BETA" != "0.0" ]]; then
@@ -493,6 +530,8 @@ start_trainer() {
       raiden_env+=" RAIDEN_USE_FFI=1 RAIDEN_FFI_USE_DIRECT_DEVICE_BUFFER=${RAIDEN_FFI_USE_DIRECT_DEVICE_BUFFER:-1}"
     fi
   fi
+  local jax_cache_cmd
+  jax_cache_cmd="$(build_jax_cache_cmd "${TRAINER_JAX_CACHE_GCS_DIR}")"
   "$PYTHON_BIN" "$YAML_GENERATOR" \
     "${YAML_DIR}/${TRAINER_JOBSET_YAML}" \
     --jobset_name="${TRAINER_ID}" \
@@ -514,6 +553,7 @@ start_trainer() {
     --worker_container_image="${TUNIX_IMAGE}" \
     --worker_container_port="${TRAINER_PORT}" \
     --worker_startup_command=" \
+      ${jax_cache_cmd} \
       PYTHONUNBUFFERED=1 \
       TUNIX_IS_INTERNAL_ENV=false \
       WEIGHT_SYNC_DISABLE_TIMEOUTS=\"${WEIGHT_SYNC_DISABLE_TIMEOUTS}\" \
@@ -701,6 +741,9 @@ if cfg:
       extra_generator_flags+=(--omit_slice_topology)
     fi
 
+    local jax_cache_cmd
+    jax_cache_cmd="$(build_jax_cache_cmd "${ROLLOUT_JAX_CACHE_GCS_DIR}")"
+
     "$PYTHON_BIN" "$YAML_GENERATOR" \
       "${YAML_DIR}/${ROLLOUT_JOBSET_YAML}" \
       --jobset_name="${replica_id}" \
@@ -713,6 +756,7 @@ if cfg:
       --worker_container_port="${ROLLOUT_PORT}" \
       "${extra_generator_flags[@]}" \
       --worker_startup_command=" \
+        ${jax_cache_cmd} \
         PYTHONUNBUFFERED=1 \
         TUNIX_IS_INTERNAL_ENV=false \
         EPISODE_TIMEOUT_SECS="${EPISODE_TIMEOUT_SECS:-5400}" \
@@ -748,7 +792,7 @@ if cfg:
         ${VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY:+VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY=\"${VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY}\"} \
         ${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:+VLLM_RAY_EXTRA_ENV_VARS_TO_COPY=\"${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY}\"} \
         ${ROLLOUT_EXTRA_ENV} \
-        SKIP_JAX_PRECOMPILE=1 VERIFY_WEIGHTS=${VERIFY_WEIGHTS} ${sandbox_env} ${ROLLOUT_USE_BATCHED_RPA:+USE_BATCHED_RPA_KERNEL=1} python -m tunix.experimental.distributed.runtime.main \
+        SKIP_JAX_PRECOMPILE=${SKIP_JAX_PRECOMPILE:-1} VERIFY_WEIGHTS=${VERIFY_WEIGHTS} ${sandbox_env} ${ROLLOUT_USE_BATCHED_RPA:+USE_BATCHED_RPA_KERNEL=1} python -m tunix.experimental.distributed.runtime.main \
           --discovery_addrs=${ORCHESTRATOR_ID}:${ORCHESTRATOR_PORT} \
           --process_executor=tunix.experimental.distributed.runtime.executor.K8sExecutor \
           --process_main=tunix.experimental.examples.common.run_rollout_node.main \
@@ -1021,6 +1065,9 @@ start_eval() {
       role_arg="--role=worker"
     fi
 
+    local jax_cache_cmd
+    jax_cache_cmd="$(build_jax_cache_cmd "${EVAL_JAX_CACHE_GCS_DIR:-${ROLLOUT_JAX_CACHE_GCS_DIR}}")"
+
     "$PYTHON_BIN" "$YAML_GENERATOR" \
       "${YAML_DIR}/${ROLLOUT_JOBSET_YAML:-jobset.pathways.yaml}" \
       --jobset_name="${replica_id}" \
@@ -1041,6 +1088,7 @@ start_eval() {
       --worker_container_image="${TUNIX_IMAGE}" \
       --worker_container_port="${eval_port}" \
       --worker_startup_command=" \
+        ${jax_cache_cmd} \
         PYTHONUNBUFFERED=1 \
         TUNIX_IS_INTERNAL_ENV=false \
         VLLM_TPU_USING_PATHWAYS=1 \
@@ -1083,7 +1131,7 @@ start_eval() {
         ${VLLM_DATA_PARALLEL_SIZE:+VLLM_DATA_PARALLEL_SIZE=${VLLM_DATA_PARALLEL_SIZE}} \
         ${ROLLOUT_ENV_FLAGS} \
         ${ROLLOUT_EXTRA_ENV} \
-        SKIP_JAX_PRECOMPILE=1 python3 -u ${eval_cmd} \
+        SKIP_JAX_PRECOMPILE=${SKIP_JAX_PRECOMPILE:-1} python3 -u ${eval_cmd} \
           ${role_arg} \
           --worker_addresses ${worker_addrs} \
           --port=${eval_port} \

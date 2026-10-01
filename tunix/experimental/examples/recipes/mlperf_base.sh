@@ -206,6 +206,22 @@ export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:- --xla_tpu_use_minor_sharding_for_m
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 
 # ==============================================================================
+# JAX Compilation Cache (GCS Persist & Restore)
+# ==============================================================================
+# Decouples GCS persistent storage from local XLA compilation execution.
+# If JAX_CACHE_GCS_DIR (or ROLLOUT_JAX_CACHE_GCS_DIR / TRAINER_JAX_CACHE_GCS_DIR)
+# is specified, worker pods sync down cache artifacts to local SSD (/tmp/jax_cache)
+# before execution and optionally upload updated cache artifacts on completion.
+export LOCAL_JAX_CACHE_DIR="${LOCAL_JAX_CACHE_DIR:-${JAX_CACHE_DIR:-/tmp/jax_cache}}"
+export JAX_CACHE_GCS_DIR="${JAX_CACHE_GCS_DIR:-}"
+export ROLLOUT_JAX_CACHE_GCS_DIR="${ROLLOUT_JAX_CACHE_GCS_DIR:-${JAX_CACHE_GCS_DIR:+${JAX_CACHE_GCS_DIR}/rollout}}"
+export TRAINER_JAX_CACHE_GCS_DIR="${TRAINER_JAX_CACHE_GCS_DIR:-${JAX_CACHE_GCS_DIR:+${JAX_CACHE_GCS_DIR}/trainer}}"
+export SAVE_JAX_CACHE="${SAVE_JAX_CACHE:-false}"
+export SKIP_JAX_PRECOMPILE="${SKIP_JAX_PRECOMPILE:-1}"
+export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-0}"
+export VLLM_XLA_CHECK_RECOMPILATION="${VLLM_XLA_CHECK_RECOMPILATION:-1}"
+
+# ==============================================================================
 # Hyperparameters & DeepSWE Pipeline Configuration
 # ==============================================================================
 export MAX_STEPS=${MAX_STEPS:-50}

@@ -78,6 +78,16 @@ export TRAJECTORY_GROUP_ORDER=${TRAJECTORY_GROUP_ORDER:-arrival}
 export DEBUG=${DEBUG:-0}
 export SAMPLER=${SAMPLER:-inprocess_vllm}
 export WEIGHT_SYNC_MODE=${WEIGHT_SYNC_MODE:-none}
+
+# JAX compilation cache configuration
+export LOCAL_JAX_CACHE_DIR=${LOCAL_JAX_CACHE_DIR:-${JAX_CACHE_DIR:-/tmp/jax_cache}}
+export JAX_CACHE_GCS_DIR=${JAX_CACHE_GCS_DIR:-}
+export ROLLOUT_JAX_CACHE_GCS_DIR=${ROLLOUT_JAX_CACHE_GCS_DIR:-${JAX_CACHE_GCS_DIR:+${JAX_CACHE_GCS_DIR}/rollout}}
+export TRAINER_JAX_CACHE_GCS_DIR=${TRAINER_JAX_CACHE_GCS_DIR:-${JAX_CACHE_GCS_DIR:+${JAX_CACHE_GCS_DIR}/trainer}}
+export SAVE_JAX_CACHE=${SAVE_JAX_CACHE:-false}
+export SKIP_JAX_PRECOMPILE=${SKIP_JAX_PRECOMPILE:-1}
+export VLLM_DISABLE_COMPILE_CACHE=${VLLM_DISABLE_COMPILE_CACHE:-0}
+export VLLM_XLA_CHECK_RECOMPILATION=${VLLM_XLA_CHECK_RECOMPILATION:-1}
 export USE_ROLLOUT_LOGPS=${USE_ROLLOUT_LOGPS:-true}
 export CHAT_PARSER=${CHAT_PARSER:-raw}
 export CHECKPOINT_SAVE_INTERVAL_STEPS=${CHECKPOINT_SAVE_INTERVAL_STEPS:-1}
@@ -192,6 +202,32 @@ apply_manifest() {
   else
     kubectl apply -f -
   fi
+}
+
+build_jax_cache_cmd() {
+  local gcs_uri="$1"
+  local local_dir="${LOCAL_JAX_CACHE_DIR:-${JAX_CACHE_DIR:-/tmp/jax_cache}}"
+  local save_cache="${SAVE_JAX_CACHE:-false}"
+
+  if [[ "${DISABLE_JAX_CACHE:-0}" == "1" || "${DISABLE_JAX_CACHE:-false}" == "true" ]]; then
+    return 0
+  fi
+
+  local cmd=""
+  # 1. Restore compilation cache from GCS if specified
+  if [[ -n "${gcs_uri}" ]]; then
+    cmd+="mkdir -p \"${local_dir}\" && { if command -v gcloud &>/dev/null; then echo \"[jax_cache] Restoring compilation cache from ${gcs_uri}...\"; gcloud storage rsync -r \"${gcs_uri}\" \"${local_dir}\" || true; elif command -v gsutil &>/dev/null; then echo \"[jax_cache] Restoring compilation cache from ${gcs_uri}...\"; gsutil -m rsync -r \"${gcs_uri}\" \"${local_dir}\" || true; fi; }; "
+  fi
+
+  # 2. Register post-execution sync back to GCS on exit if save is enabled
+  if [[ "${save_cache}" == "true" && -n "${gcs_uri}" ]]; then
+    cmd+="trap 'if [ -d \"${local_dir}\" ]; then if command -v gcloud &>/dev/null; then echo \"[jax_cache] Uploading compilation cache to ${gcs_uri}...\"; gcloud storage rsync -r \"${local_dir}\" \"${gcs_uri}\" || true; elif command -v gsutil &>/dev/null; then echo \"[jax_cache] Uploading compilation cache to ${gcs_uri}...\"; gsutil -m rsync -r \"${local_dir}\" \"${gcs_uri}\" || true; fi; fi' EXIT; "
+  fi
+
+  # 3. Export caching environment flags for JAX and vLLM
+  cmd+="export JAX_COMPILATION_CACHE_DIR=\"${local_dir}\" VLLM_XLA_CACHE_PATH=\"${local_dir}\" VLLM_DISABLE_COMPILE_CACHE=0 VLLM_XLA_CHECK_RECOMPILATION=1; "
+
+  echo "${cmd}"
 }
 
 stop_orchestrator() {
@@ -348,6 +384,9 @@ start_trainer() {
     opt_chain_flags="--optimizer_opt_chain_type=\"${OPT_CHAIN_TYPE}\" --optimizer_chain_kwargs=\"{'max_norm': ${MAX_GRAD_NORM}}\""
   fi
 
+  local jax_cache_cmd
+  jax_cache_cmd="$(build_jax_cache_cmd "${TRAINER_JAX_CACHE_GCS_DIR}")"
+
   "$PYTHON" "$YAML_GEN" \
     "$YAML_DIR/${TRAINER_JOBSET_YAML}" \
     --jobset_name="${TRAINER_ID}" \
@@ -368,6 +407,7 @@ start_trainer() {
     --worker_container_image="${TUNIX_IMAGE}" \
     --worker_container_port="${TRAINER_PORT}" \
     --worker_startup_command=" \
+      ${jax_cache_cmd} \
       ${HF_TOKEN:+HF_TOKEN=\"${HF_TOKEN}\"} VERIFY_WEIGHTS=${VERIFY_WEIGHTS} ENABLE_PATHWAYS_PERSISTENCE=${ENABLE_PATHWAYS_PERSISTENCE}${CHECKPOINT_ASYNC:+ CHECKPOINT_ASYNC=${CHECKPOINT_ASYNC}}${CKPT_D2H_CONCURRENT_GB:+ CKPT_D2H_CONCURRENT_GB=${CKPT_D2H_CONCURRENT_GB}}${PATHWAYS_CHECKPOINTING_IMPL:+ PATHWAYS_CHECKPOINTING_IMPL=${PATHWAYS_CHECKPOINTING_IMPL}}${COLOCATED_PYTHON_SIDECAR_IMAGE:+ COLOCATED_PYTHON_SIDECAR_IMAGE=${COLOCATED_PYTHON_SIDECAR_IMAGE}}${raiden_env}${MAXTEXT_EXTRA_FLAGS:+ MAXTEXT_EXTRA_FLAGS=\"${MAXTEXT_EXTRA_FLAGS}\"}${TRAINER_EXTRA_ENV:+ ${TRAINER_EXTRA_ENV}} python -m tunix.experimental.distributed.runtime.main \
         --discovery_addrs=${ORCHESTRATOR_ID}:${ORCHESTRATOR_PORT} \
         --process_executor=tunix.experimental.distributed.runtime.executor.K8sExecutor \
@@ -555,6 +595,9 @@ if cfg:
     raiden_env+=" RAIDEN_USE_FFI=0"
   fi
 
+  local jax_cache_cmd
+  jax_cache_cmd="$(build_jax_cache_cmd "${ROLLOUT_JAX_CACHE_GCS_DIR}")"
+
   "$PYTHON" "$YAML_GEN" \
     "$YAML_DIR/${ROLLOUT_JOBSET_YAML}" \
     --jobset_name="${target_id}" \
@@ -568,7 +611,8 @@ if cfg:
     --worker_container_image="${TUNIX_IMAGE}" \
     --worker_container_port="${ROLLOUT_PORT}" \
     --worker_startup_command=" \
-      ${HF_TOKEN:+HF_TOKEN=\"${HF_TOKEN}\"} SKIP_JAX_PRECOMPILE=1 VERIFY_WEIGHTS=${VERIFY_WEIGHTS}${raiden_env}${ROLLOUT_EXTRA_ENV:+ ${ROLLOUT_EXTRA_ENV}} ${ROLLOUT_USE_BATCHED_RPA:+USE_BATCHED_RPA_KERNEL=1} python -m tunix.experimental.distributed.runtime.main \
+      ${jax_cache_cmd} \
+      ${HF_TOKEN:+HF_TOKEN=\"${HF_TOKEN}\"} SKIP_JAX_PRECOMPILE=${SKIP_JAX_PRECOMPILE:-1} VERIFY_WEIGHTS=${VERIFY_WEIGHTS}${raiden_env}${ROLLOUT_EXTRA_ENV:+ ${ROLLOUT_EXTRA_ENV}} ${ROLLOUT_USE_BATCHED_RPA:+USE_BATCHED_RPA_KERNEL=1} python -m tunix.experimental.distributed.runtime.main \
         --discovery_addrs=${ORCHESTRATOR_ID}:${ORCHESTRATOR_PORT} \
         --process_executor=tunix.experimental.distributed.runtime.executor.K8sExecutor \
         --process_main=tunix.experimental.examples.common.run_rollout_node.main \
