@@ -214,6 +214,54 @@ export VLLM_ENABLE_V1_MULTIPROCESSING=0
 # before execution and optionally upload updated cache artifacts on completion.
 export LOCAL_JAX_CACHE_DIR="${LOCAL_JAX_CACHE_DIR:-${JAX_CACHE_DIR:-/tmp/jax_cache}}"
 export JAX_CACHE_GCS_DIR="${JAX_CACHE_GCS_DIR:-}"
+
+# If no GCS cache dir is explicitly provided, auto-resolve defaults based on region,
+# TPU hardware generation (v5p vs v7x), model, and sharding topology.
+if [[ -z "${JAX_CACHE_GCS_DIR}" && -z "${ROLLOUT_JAX_CACHE_GCS_DIR:-}" && -z "${TRAINER_JAX_CACHE_GCS_DIR:-}" ]]; then
+  _cache_bucket=""
+  case "${REGION:-}" in
+    europe-west4)
+      _cache_bucket="gs://atwigg-trellis-europe-west4-dev"
+      ;;
+    us-central1)
+      _cache_bucket="gs://atwigg-trellis-us-central1"
+      ;;
+    us-east1)
+      _cache_bucket="gs://atwigg-trellis-us-east1-fast-dev"
+      ;;
+    *)
+      if [[ -n "${BUCKET:-}" ]]; then
+        _cache_bucket="${BUCKET}"
+      elif [[ -n "${MAXTEXT_OUTPUT_DIR:-}" ]]; then
+        _cache_bucket="$(echo "${MAXTEXT_OUTPUT_DIR}" | grep -o '^gs://[^/]*' || true)"
+      fi
+      ;;
+  esac
+
+  if [[ -n "${_cache_bucket}" ]]; then
+    _hw="unknown"
+    if [[ "${ROLLOUT_TPU_SLICE:-}" == tpuv5* || "${TRAINER_TPU_SLICE:-}" == tpuv5* ]]; then
+      _hw="v5p"
+    elif [[ "${ROLLOUT_TPU_SLICE:-}" == tpu7x* || "${TRAINER_TPU_SLICE:-}" == tpu7x* ]]; then
+      _hw="v7x"
+    fi
+
+    _model_slug="$(echo "${MODEL_NAME:-${MAXTEXT_MODEL_NAME:-model}}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._' '-' | sed 's/-$//')"
+    _rollout_topo="${ROLLOUT_TPU_SLICE#*:}"
+    _rollout_ep="${ROLLOUT_MESH_EXPERT:-1}"
+    _rollout_tp="${ROLLOUT_MESH_TP:-1}"
+
+    _trainer_topo="${TRAINER_TPU_SLICE#*:}"
+    _trainer_fsdp="${TRAINER_MESH_FSDP:-1}"
+    _trainer_tp="${TRAINER_MESH_TP:-1}"
+    _trainer_ep="${TRAINER_MESH_EXPERT:-1}"
+    _trainer_cp="${TRAINER_MESH_CONTEXT:-1}"
+
+    export ROLLOUT_JAX_CACHE_GCS_DIR="${_cache_bucket}/jax_cache/${_hw}/${_model_slug}/rollout_${_rollout_topo}_ep${_rollout_ep}_tp${_rollout_tp}"
+    export TRAINER_JAX_CACHE_GCS_DIR="${_cache_bucket}/jax_cache/${_hw}/${_model_slug}/trainer_${_trainer_topo}_fsdp${_trainer_fsdp}_tp${_trainer_tp}_ep${_trainer_ep}_cp${_trainer_cp}"
+  fi
+fi
+
 export ROLLOUT_JAX_CACHE_GCS_DIR="${ROLLOUT_JAX_CACHE_GCS_DIR:-${JAX_CACHE_GCS_DIR:+${JAX_CACHE_GCS_DIR}/rollout}}"
 export TRAINER_JAX_CACHE_GCS_DIR="${TRAINER_JAX_CACHE_GCS_DIR:-${JAX_CACHE_GCS_DIR:+${JAX_CACHE_GCS_DIR}/trainer}}"
 export SAVE_JAX_CACHE="${SAVE_JAX_CACHE:-true}"
