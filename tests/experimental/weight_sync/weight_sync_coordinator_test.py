@@ -2004,6 +2004,7 @@ class ParallelH2HTest(CoordinatorTestBase):
     self.assertIs(result.state, RoundState.ABORTED)
     self.assertNotIn("pre", self.phases("sampler"))
     self.assertNotIn("sync", self.phases("sampler"))
+    self.assertNotIn("abort", self.phases("sampler"))
     self.assert_serving_untouched(dest)
     self.assertIsNone(self.coordinator.poisoned)
     self.assertFalse(any(w.needs_restart for w in result.workers))
@@ -2031,39 +2032,23 @@ class ParallelH2HTest(CoordinatorTestBase):
 
     self._assert_clean_transfer_failure_recovers(dest)
 
-  def test_abort_on_unpaused_destination_is_accepted(self):
-    dest = FakeDestination("sampler", [])
+  def test_failed_transfer_sends_no_abort_to_unpaused_destinations(self):
+    dest = FakeDestination("sampler", [], fail_on="abort")
     self.make_parallel(dest)
     self.handler.result_success = False
 
     with self.assertRaises(WeightSyncError) as ctx:
       self.sync()
 
-    # The abort closes the round on the worker without having touched
-    # serving state: the report reads "aborted", not unknown.
-    self.assertIn("abort", self.phases("sampler"))
-    self.assertEqual(dest.tracker.report()["phase"], "aborted")
-    self.assertEqual(
-        [w.phase for w in ctx.exception.result.workers], ["aborted"]
-    )
-
-  def test_abort_rpc_failure_after_unquiesced_transfer_does_not_poison(self):
-    dest = FakeDestination("sampler", [], fail_on="abort")
-    self.make_parallel(dest)
-    self.handler.result_success = False
-
-    with self.assertRaises(WeightSyncError) as ctx:
-      self.sync(policy_version=1)
-
-    self.assertIs(ctx.exception.result.state, RoundState.ABORTED)
-    self.assertTrue(
-        any("abort_weight_sync" in f for f in ctx.exception.result.failures)
-    )
+    # Nothing was quiesced, so nothing is rolled back: the destination never
+    # sees this round, and an abort that would fail is never sent.
+    self.assertNotIn("abort", self.phases("sampler"))
+    self.assertEqual(dest.tracker.report()["phase"], "idle")
+    result = ctx.exception.result
+    self.assertIs(result.state, RoundState.ABORTED)
+    self.assertFalse(any("abort_weight_sync" in f for f in result.failures))
+    self.assertEqual([w.needs_restart for w in result.workers], [False])
     self.assertIsNone(self.coordinator.poisoned)
-    self.assert_serving_untouched(dest)
-
-    self.handler.result_success = True
-    self.assertIs(self.sync(policy_version=2).state, RoundState.COMMITTED)
 
   def test_timed_out_transfer_parks_unknown_as_with_flag_off(self):
     dest = FakeDestination("sampler", [])

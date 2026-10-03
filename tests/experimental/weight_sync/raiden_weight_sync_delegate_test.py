@@ -249,9 +249,9 @@ class RaidenWeightSyncDelegateTest(unittest.IsolatedAsyncioTestCase):
     self.assertIs(delegate._synchronizers[0].kwargs["auto_h2d"], False)
 
   async def test_abort_without_pre_opens_round_as_aborted(self):
-    # parallel_h2h relies on this: a transfer failure aborts destinations that
-    # never ran pre. The abort must be accepted and touch nothing but the
-    # tracker (the sampler was never paused or freed).
+    # An abort may outrun pre (e.g. a cancelled round). The delegate must
+    # accept it and touch nothing but the tracker: the sampler was never
+    # paused or freed, and transport staging is left alone.
     sampler = mock.MagicMock()
     delegate = self._delegate()
     await delegate.bind_weight_sync(state={"w": 1}, sampler=sampler)

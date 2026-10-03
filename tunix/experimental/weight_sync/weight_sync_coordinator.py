@@ -1515,32 +1515,26 @@ class WeightSyncCoordinator:
         """Clean transfer failure while destinations were still serving.
 
         parallel_h2h only: no destination ran pre_weight_sync this round, so
-        none is paused and there is nothing to restore. The abort RPC is
-        still sent because it is safe on an un-paused destination and closes
-        this round on each worker (its report reads "aborted" rather than
-        unknown):
-          - WorkerRoundTracker admits "aborted" as a round-opening phase
-            (_ROUND_OPENING_PHASES), so an abort for a round the worker never
-            prepared is accepted rather than refused as a stray;
-          - RaidenWeightSyncDelegate.abort_weight_sync only updates the
-            tracker;
-          - VllmSamplerAdapter.abort_weight_sync calls resume() when no weight
-            update is open, and RLVllmSampler.resume() returns early when the
-            sampler is not paused, so a serving engine is left untouched.
-        Unlike `_rollback`, an abort RPC failure here does NOT mean a worker
-        may be stuck unserving (it was never quiesced), so it is recorded but
-        the round ends ABORTED and the coordinator is not poisoned.
+        none is paused and there is nothing to restore. No abort RPC is
+        sent, because the destination abort stack is NOT a no-op on a worker
+        that never ran pre: RolloutWorker.abort_weight_sync unconditionally
+        sets the worker READY (skipping initialize() on a still-PENDING
+        worker, which pre would have run), and RolloutManager's abort resumes
+        every collector and reopens admission, overriding any pause that is
+        not this round's. The round never opened on the workers (their
+        trackers only open on pre or abort), the next round's higher uuid
+        opens cleanly with pre, and the Raiden delegate's abort does not
+        touch transport staging anyway, so a partial host-staging fill is
+        simply overwritten by the next transfer. The round ends ABORTED and
+        the coordinator is not poisoned; source staging is released as on
+        any clean failure.
         """
-        nonlocal state, failures
-        abort_failures = await self._abort_all(destinations, prepared_request)
-        if abort_failures:
-          failures += abort_failures
-          logging.warning(
-              "abort after a transfer failure on still-serving destinations"
-              " did not complete everywhere; destinations were never"
-              " quiesced, so this is not a stuck-worker condition: %s",
-              abort_failures,
-          )
+        nonlocal state
+        logging.warning(
+            "round %d: transfer failed before any destination was quiesced"
+            " (parallel_h2h); destinations kept serving, nothing to abort",
+            round_index,
+        )
         state = RoundState.ABORTED
         await record_workers(reason)
 
