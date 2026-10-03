@@ -562,6 +562,15 @@ def _create_vllm_worker(args, tokenizer):
   )
 
   if args.sampler == "vllm":
+    from tunix.experimental.weight_sync import weight_sync_coordinator  # pylint: disable=g-import-not-at-top
+
+    if weight_sync_coordinator.is_parallel_h2h_enabled():
+      # SAMPLER=vllm binds Raiden inside tpu_inference with auto_h2d=True, so
+      # a transfer before quiesce would write into live serving weights.
+      raise ValueError(
+          "WEIGHT_SYNC_PARALLEL_H2H is not supported with --sampler=vllm;"
+          " use inprocess_vllm or vanilla, or unset the flag."
+      )
     sampler_adapter, rollout_config = _create_vllm_sampler(args, tokenizer)
   else:
     sampler_adapter, rollout_config = _create_inprocess_vllm_sampler(

@@ -152,6 +152,12 @@ class RaidenWeightSyncDelegate:
       # transfer only filled host staging and this call performs the
       # host-to-device install. Either way completion is guaranteed before
       # checksums/post.
+      if not self._auto_h2d and os.environ.get(
+          "VERIFY_WEIGHTS", ""
+      ).lower() == "true":
+        # Receipt that the transfer staged into host memory only: before the
+        # install these must still equal the previous round's checksums.
+        logging.info("destination checksums before h2d: %s", sync.checksums())
       sync.h2d()
       if os.environ.get("VERIFY_WEIGHTS", "").lower() == "true":
         logging.info("destination checksums: %s", sync.checksums())
