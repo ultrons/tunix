@@ -115,6 +115,12 @@ else
 fi
 export ROLLOUT_FREE_KV_CACHE=${ROLLOUT_FREE_KV_CACHE:-false}
 export IN_FLIGHT_WEIGHT_UPDATES=${IN_FLIGHT_WEIGHT_UPDATES:-false}
+# Optional (unset by default): WEIGHT_SYNC_PARALLEL_H2H=true runs the Raiden
+# transfer while rollouts keep serving and quiesces them only for h2d. It is
+# forwarded to both the orchestrator (round order) and the rollout workers
+# (auto_h2d=False on RaidenWeightSyncDelegate). Only the inprocess_vllm and
+# vanilla samplers honor it on the destination side; SAMPLER=vllm binds Raiden
+# inside tpu_inference with auto_h2d=True and must not use it.
 # Serve the oldest in-flight prompt batch first: the orchestrator stamps each
 # rollout request with its batch index as its priority and the rollouts run
 # vLLM with scheduling_policy=priority. `false` serves requests in arrival
@@ -405,6 +411,7 @@ start_orchestrator() {
       ROLLOUT_WORKERS=\"${ROLLOUT_WORKERS:-${ROLLOUT_REPLICAS:-1}}\" \
       EPISODE_TIMEOUT_SECS=\"${EPISODE_TIMEOUT_SECS:-5400}\" \
       WEIGHT_SYNC_DISABLE_TIMEOUTS=\"${WEIGHT_SYNC_DISABLE_TIMEOUTS}\" \
+      ${WEIGHT_SYNC_PARALLEL_H2H:+WEIGHT_SYNC_PARALLEL_H2H=\"${WEIGHT_SYNC_PARALLEL_H2H}\"} \
       ${ROLLOUT_FP8:+ROLLOUT_FP8=\"${ROLLOUT_FP8}\"} \
       ${TRAINER_FP8:+TRAINER_FP8=\"${TRAINER_FP8}\"} \
       ${ROLLOUT_QUANTIZATION:+ROLLOUT_QUANTIZATION=\"${ROLLOUT_QUANTIZATION}\"} \
@@ -781,6 +788,7 @@ if cfg:
         ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING} \
         ROLLOUT_FREE_KV_CACHE=${ROLLOUT_FREE_KV_CACHE} \
         IN_FLIGHT_WEIGHT_UPDATES=${IN_FLIGHT_WEIGHT_UPDATES} \
+        ${WEIGHT_SYNC_PARALLEL_H2H:+WEIGHT_SYNC_PARALLEL_H2H=\"${WEIGHT_SYNC_PARALLEL_H2H}\"} \
         VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-8} \
         VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.9} \
         ${NUM_PRECOMPILE_WORKERS:+NUM_PRECOMPILE_WORKERS=${NUM_PRECOMPILE_WORKERS}} \

@@ -14,6 +14,7 @@
 
 """Tests verifying destination-side Raiden weight sync delegation."""
 
+import os
 import unittest
 from unittest import mock
 
@@ -72,6 +73,12 @@ class RaidenWeightSyncDelegateTest(unittest.IsolatedAsyncioTestCase):
     )
     patcher.start()
     self.addCleanup(patcher.stop)
+    # The default auto_h2d is derived from this env var; isolate every test
+    # from the ambient environment.
+    env_patcher = mock.patch.dict(os.environ)
+    env_patcher.start()
+    self.addCleanup(env_patcher.stop)
+    os.environ.pop("WEIGHT_SYNC_PARALLEL_H2H", None)
 
   def _delegate(self):
     return raiden_weight_sync_delegate.RaidenWeightSyncDelegate()
@@ -210,6 +217,55 @@ class RaidenWeightSyncDelegateTest(unittest.IsolatedAsyncioTestCase):
     req = _Request(policy_version=1, req_id="req-1")
     res = await delegate.abort_weight_sync(sync_request=req)
     self.assertTrue(res)
+
+
+  async def test_auto_h2d_defaults_to_true_when_env_unset(self):
+    delegate = raiden_weight_sync_delegate.RaidenWeightSyncDelegate()
+    self.assertIs(delegate._synchronizers[0].kwargs["auto_h2d"], True)
+
+  async def test_auto_h2d_false_when_parallel_h2h_env_on(self):
+    for value in ("true", "1", "TRUE"):
+      with self.subTest(value=value):
+        with mock.patch.dict(os.environ, {"WEIGHT_SYNC_PARALLEL_H2H": value}):
+          delegate = raiden_weight_sync_delegate.RaidenWeightSyncDelegate()
+        self.assertEqual(
+            delegate._synchronizers[0].kwargs, {"auto_h2d": False}
+        )
+
+  async def test_auto_h2d_true_when_parallel_h2h_env_off(self):
+    with mock.patch.dict(os.environ, {"WEIGHT_SYNC_PARALLEL_H2H": "false"}):
+      delegate = raiden_weight_sync_delegate.RaidenWeightSyncDelegate()
+    self.assertIs(delegate._synchronizers[0].kwargs["auto_h2d"], True)
+
+  async def test_explicit_auto_h2d_overrides_env(self):
+    with mock.patch.dict(os.environ, {"WEIGHT_SYNC_PARALLEL_H2H": "true"}):
+      delegate = raiden_weight_sync_delegate.RaidenWeightSyncDelegate(
+          auto_h2d=True
+      )
+    self.assertIs(delegate._synchronizers[0].kwargs["auto_h2d"], True)
+    delegate = raiden_weight_sync_delegate.RaidenWeightSyncDelegate(
+        auto_h2d=False
+    )
+    self.assertIs(delegate._synchronizers[0].kwargs["auto_h2d"], False)
+
+  async def test_abort_without_pre_opens_round_as_aborted(self):
+    # parallel_h2h relies on this: a transfer failure aborts destinations that
+    # never ran pre. The abort must be accepted and touch nothing but the
+    # tracker (the sampler was never paused or freed).
+    sampler = mock.MagicMock()
+    delegate = self._delegate()
+    await delegate.bind_weight_sync(state={"w": 1}, sampler=sampler)
+    req = _Request(policy_version=1, req_id="req-1")
+    req.extra_config["uuid"] = 1
+    self.assertTrue(await delegate.abort_weight_sync(sync_request=req))
+    self.assertEqual(delegate.get_weight_sync_status()["phase"], "aborted")
+    self.assertEqual(sampler.mock_calls, [])
+    self.assertEqual(delegate._synchronizers[0].h2d_calls, 0)
+    # The next round opens normally.
+    nxt = _Request(policy_version=2, req_id="req-2")
+    nxt.extra_config["uuid"] = 2
+    await delegate.pre_weight_sync(sync_request=nxt)
+    self.assertEqual(delegate.get_weight_sync_status()["phase"], "prepared")
 
 
 if __name__ == "__main__":

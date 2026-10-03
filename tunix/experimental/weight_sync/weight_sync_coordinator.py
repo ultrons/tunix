@@ -560,6 +560,22 @@ def is_weight_sync_timeouts_disabled() -> bool:
   return False
 
 
+PARALLEL_H2H_ENV = "WEIGHT_SYNC_PARALLEL_H2H"
+
+
+def is_parallel_h2h_enabled() -> bool:
+  """Whether `WEIGHT_SYNC_PARALLEL_H2H` asks for transfer-before-quiesce.
+
+  Read by BOTH sides of a round, which live in different processes: the
+  coordinator (orchestrator) uses it to order the round, and the Raiden
+  destination delegate (rollout worker) uses it to bind with `auto_h2d=False`
+  so the transfer only fills host staging. The variable must be forwarded to
+  both processes; default is false (today's quiesce-then-transfer order).
+  """
+  val = os.getenv(PARALLEL_H2H_ENV, "false")
+  return val.strip().lower() in _TRUTHY_ENV_VALUES
+
+
 def _env_float(name: str, default: float) -> float:
   val = os.getenv(name)
   if val is None or not val.strip():
@@ -781,6 +797,7 @@ class WeightSyncCoordinator:
       first_uuid: int = 1,
       timeouts: Optional[PhaseTimeouts] = None,
       disable_timeouts: Optional[bool] = None,
+      parallel_h2h: Optional[bool] = None,
   ):
     self._registry = registry
     self._handler = handler
@@ -797,6 +814,29 @@ class WeightSyncCoordinator:
         disable_timeouts or is_weight_sync_timeouts_disabled(),
         self._timeouts,
     )
+    if parallel_h2h is None:
+      parallel_h2h = is_parallel_h2h_enabled()
+    self._parallel_h2h = bool(parallel_h2h)
+    logging.info(
+        "WeightSyncCoordinator parallel_h2h=%s (order=%s)",
+        self._parallel_h2h,
+        "transfer_before_quiesce"
+        if self._parallel_h2h
+        else "quiesce_before_transfer",
+    )
+    if self._parallel_h2h:
+      # Transfer-before-quiesce is only safe when every destination's
+      # transport stages into host memory and installs on device only in
+      # weight_sync() (auto_h2d=False). A destination that installs chunks as
+      # they arrive would have its serving weights overwritten mid-serve.
+      logging.warning(
+          "%s is on: every destination must bind its transport with"
+          " auto_h2d=False (host staging only). RaidenWeightSyncDelegate"
+          " derives this from the same env var; transports that hardcode"
+          " auto_h2d=True (e.g. the RLVllmSampler/tpu_inference path) are NOT"
+          " safe with this flag.",
+          PARALLEL_H2H_ENV,
+      )
 
     self._round_index = 0
     self._next_uuid = first_uuid
@@ -809,6 +849,11 @@ class WeightSyncCoordinator:
   def round_index(self) -> int:
     """Number of rounds started so far."""
     return self._round_index
+
+  @property
+  def parallel_h2h(self) -> bool:
+    """Whether rounds transfer before quiescing destinations."""
+    return self._parallel_h2h
 
   @property
   def last_committed_version(self) -> Optional[int]:
@@ -1428,30 +1473,88 @@ class WeightSyncCoordinator:
           **extra_config,
       )
 
-      # --- downtime starts here ---
-      quiesce_attempted = True
-      t_phase = time.monotonic()
-      pre_failures = await self._phase_on_all(
-          destinations, "pre_weight_sync", prepared_request, self._timeouts.pre
-      )
-      t_pre_s = time.monotonic() - t_phase
-      logging.info(
-          "WEIGHT_SYNC_PHASE round=%d req_id=%s phase=pre"
-          " elapsed_s=%.3f timeout=%s workers=%d failures=%d",
-          round_index,
-          req_id,
-          t_pre_s,
-          _format_timeout(self._timeouts.pre),
-          len(destinations),
-          len(pre_failures),
-      )
-      if pre_failures:
-        failures += pre_failures
-        state = await self._rollback(destinations, prepared_request, failures)
-        poison_if_needed()
-        await record_workers("pre_weight_sync failed")
-        raise fail("pre_weight_sync failed")
-      state = RoundState.PREPARED
+      async def quiesce_destinations() -> None:
+        """The pre_weight_sync phase: downtime starts here.
+
+        Runs before the transfer by default, or after a successful transfer
+        when `parallel_h2h` is on. Either way its semantics are the same: a
+        pre failure rolls every destination back.
+        """
+        nonlocal state, quiesce_attempted, t_pre_s, failures
+        # --- downtime starts here ---
+        quiesce_attempted = True
+        t_phase = time.monotonic()
+        pre_failures = await self._phase_on_all(
+            destinations,
+            "pre_weight_sync",
+            prepared_request,
+            self._timeouts.pre,
+        )
+        t_pre_s = time.monotonic() - t_phase
+        logging.info(
+            "WEIGHT_SYNC_PHASE round=%d req_id=%s phase=pre"
+            " elapsed_s=%.3f timeout=%s workers=%d failures=%d",
+            round_index,
+            req_id,
+            t_pre_s,
+            _format_timeout(self._timeouts.pre),
+            len(destinations),
+            len(pre_failures),
+        )
+        if pre_failures:
+          failures += pre_failures
+          state = await self._rollback(
+              destinations, prepared_request, failures
+          )
+          poison_if_needed()
+          await record_workers("pre_weight_sync failed")
+          raise fail("pre_weight_sync failed")
+        state = RoundState.PREPARED
+
+      async def rollback_unquiesced_transfer_failure(reason: str) -> None:
+        """Clean transfer failure while destinations were still serving.
+
+        parallel_h2h only: no destination ran pre_weight_sync this round, so
+        none is paused and there is nothing to restore. The abort RPC is
+        still sent because it is safe on an un-paused destination and closes
+        this round on each worker (its report reads "aborted" rather than
+        unknown):
+          - WorkerRoundTracker admits "aborted" as a round-opening phase
+            (_ROUND_OPENING_PHASES), so an abort for a round the worker never
+            prepared is accepted rather than refused as a stray;
+          - RaidenWeightSyncDelegate.abort_weight_sync only updates the
+            tracker;
+          - VllmSamplerAdapter.abort_weight_sync calls resume() when no weight
+            update is open, and RLVllmSampler.resume() returns early when the
+            sampler is not paused, so a serving engine is left untouched.
+        Unlike `_rollback`, an abort RPC failure here does NOT mean a worker
+        may be stuck unserving (it was never quiesced), so it is recorded but
+        the round ends ABORTED and the coordinator is not poisoned.
+        """
+        nonlocal state, failures
+        abort_failures = await self._abort_all(destinations, prepared_request)
+        if abort_failures:
+          failures += abort_failures
+          logging.warning(
+              "abort after a transfer failure on still-serving destinations"
+              " did not complete everywhere; destinations were never"
+              " quiesced, so this is not a stuck-worker condition: %s",
+              abort_failures,
+          )
+        state = RoundState.ABORTED
+        await record_workers(reason)
+
+      if self._parallel_h2h:
+        # The transfer only fills destination host staging (auto_h2d=False),
+        # so it runs while destinations keep serving; pre runs after it.
+        logging.info(
+            "WEIGHT_SYNC_ORDER round=%d req_id=%s order=transfer_before_quiesce",
+            round_index,
+            req_id,
+        )
+        state = RoundState.PREPARED
+      else:
+        await quiesce_destinations()
 
       state = RoundState.TRANSFERRING
       transfer_in_flight = True
@@ -1526,6 +1629,9 @@ class WeightSyncCoordinator:
         logging.error("transfer raised exception: %s", e, exc_info=True)
         transfer_in_flight = False
         failures.append(f"transfer: {e!r}")
+        if not quiesce_attempted:
+          await rollback_unquiesced_transfer_failure("transfer raised")
+          raise fail("transfer raised") from e
         state = await self._rollback(destinations, prepared_request, failures)
         poison_if_needed()
         await record_workers("transfer raised")
@@ -1533,10 +1639,16 @@ class WeightSyncCoordinator:
 
       if not transfer.success:
         failures.append(f"transfer: {transfer.message}")
+        if not quiesce_attempted:
+          await rollback_unquiesced_transfer_failure("transfer failed")
+          raise fail("transfer failed")
         state = await self._rollback(destinations, prepared_request, failures)
         poison_if_needed()
         await record_workers("transfer failed")
         raise fail("transfer failed")
+
+      if self._parallel_h2h:
+        await quiesce_destinations()
 
       state = RoundState.H2D_IN_PROGRESS
       t_phase = time.monotonic()

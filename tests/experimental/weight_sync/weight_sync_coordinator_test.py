@@ -412,6 +412,7 @@ class CoordinatorTestBase(absltest.TestCase):
       *destinations: FakeDestination,
       sources=None,
       timeouts=None,
+      parallel_h2h=False,
   ):
     self.log: list[str] = []
     self.wire = Wire()
@@ -435,6 +436,7 @@ class CoordinatorTestBase(absltest.TestCase):
         handler=self.handler,
         controller_id="test-controller",
         timeouts=timeouts or FAST_TIMEOUTS,
+        parallel_h2h=parallel_h2h,
     )
     return self.coordinator
 
@@ -1888,6 +1890,265 @@ class SourcePrepareTimeoutTest(CoordinatorTestBase):
     # Release still runs; workers must make it safe against an in-flight
     # prepare for the same round.
     self.assertEqual(slow_source.release_calls, 1)
+
+
+class ParallelH2HTest(CoordinatorTestBase):
+  """WEIGHT_SYNC_PARALLEL_H2H: transfer while destinations keep serving."""
+
+  def make_parallel(self, *destinations, **kwargs):
+    return self.make(*destinations, parallel_h2h=True, **kwargs)
+
+  def assert_serving_untouched(self, dest: FakeDestination):
+    self.assertEqual(dest.serving, [0.0] * 4)
+    self.assertTrue(dest.kv_cache)
+    self.assertTrue(dest.admitting)
+    self.assertIsNone(dest.staging)
+
+  def test_env_default_is_off(self):
+    with mock.patch.dict(os.environ):
+      os.environ.pop("WEIGHT_SYNC_PARALLEL_H2H", None)
+      coordinator = weight_sync_coordinator.WeightSyncCoordinator(
+          registry=worker_registry.WorkerRegistry(),
+          handler=FakeHandler(Wire(), []),
+      )
+      self.assertFalse(coordinator.parallel_h2h)
+      self.assertFalse(weight_sync_coordinator.is_parallel_h2h_enabled())
+
+  def test_env_turns_it_on_and_explicit_argument_wins(self):
+    with mock.patch.dict(os.environ, {"WEIGHT_SYNC_PARALLEL_H2H": "true"}):
+      on = weight_sync_coordinator.WeightSyncCoordinator(
+          registry=worker_registry.WorkerRegistry(),
+          handler=FakeHandler(Wire(), []),
+      )
+      off = weight_sync_coordinator.WeightSyncCoordinator(
+          registry=worker_registry.WorkerRegistry(),
+          handler=FakeHandler(Wire(), []),
+          parallel_h2h=False,
+      )
+    self.assertTrue(on.parallel_h2h)
+    self.assertFalse(off.parallel_h2h)
+
+  def test_flag_off_keeps_quiesce_before_transfer(self):
+    dest = FakeDestination("sampler", [])
+    coordinator = self.make(dest)
+    self.assertFalse(coordinator.parallel_h2h)
+
+    with self.assertLogs(level="INFO") as logs:
+      self.sync()
+
+    self.assertEqual(
+        self.phases("sampler"), ["bind", "metadata", "pre", "sync", "post"]
+    )
+    self.assertLess(self.log.index("sampler:pre"), self.log.index("transfer"))
+    self.assertNotIn("WEIGHT_SYNC_ORDER", "\n".join(logs.output))
+
+  def test_transfer_runs_before_any_pre(self):
+    d1 = FakeDestination("s1", [])
+    d2 = FakeDestination("s2", [])
+    self.make_parallel(d1, d2)
+
+    with self.assertLogs(level="INFO") as logs:
+      result = self.sync(policy_version=3)
+
+    self.assertIs(result.state, RoundState.COMMITTED)
+    for wid, dest in (("s1", d1), ("s2", d2)):
+      self.assertEqual(
+          self.phases(wid), ["bind", "metadata", "pre", "sync", "post"]
+      )
+      self.assertLess(self.log.index("transfer"), self.log.index(f"{wid}:pre"))
+      self.assertLess(
+          self.log.index(f"{wid}:pre"), self.log.index(f"{wid}:sync")
+      )
+      self.assertEqual(dest.serving, expected_pattern(3))
+      self.assertTrue(dest.admitting)
+      self.assertTrue(dest.kv_cache)
+    # Registration still precedes the transfer.
+    register_indices = [
+        i for i, e in enumerate(self.log) if e.startswith("register:")
+    ]
+    self.assertLess(max(register_indices), self.log.index("transfer"))
+    blob = "\n".join(logs.output)
+    self.assertIn("order=transfer_before_quiesce", blob)
+    for phase in (
+        "bind", "metadata", "source_prepare", "register", "pre", "transfer",
+        "h2d", "post", "release",
+    ):
+      self.assertRegex(blob, rf"WEIGHT_SYNC_PHASE round=0 .* phase={phase} ")
+    self.assertIn("WEIGHT_SYNC_PROFILE round=0", blob)
+    self.assertIn("WEIGHT_SYNC_PHASE_TIMINGS round=0", blob)
+
+  def test_destination_serving_during_transfer(self):
+    dest = FakeDestination("sampler", [])
+    self.make_parallel(dest)
+    seen = {}
+    original = self.handler.transfer
+
+    def transfer(*args, **kwargs):
+      seen["admitting"] = dest.admitting
+      seen["kv_cache"] = dest.kv_cache
+      seen["phase"] = dest.tracker.report()["phase"]
+      return original(*args, **kwargs)
+
+    self.handler.transfer = transfer
+    self.sync()
+
+    self.assertEqual(
+        seen, {"admitting": True, "kv_cache": True, "phase": "idle"}
+    )
+
+  def _assert_clean_transfer_failure_recovers(self, dest):
+    with self.assertRaises(WeightSyncError) as ctx:
+      self.sync(policy_version=1)
+
+    result = ctx.exception.result
+    self.assertIs(result.state, RoundState.ABORTED)
+    self.assertNotIn("pre", self.phases("sampler"))
+    self.assertNotIn("sync", self.phases("sampler"))
+    self.assert_serving_untouched(dest)
+    self.assertIsNone(self.coordinator.poisoned)
+    self.assertFalse(any(w.needs_restart for w in result.workers))
+    # A clean failure lets the source release its staging.
+    self.assertEqual(self.sources[0].release_calls, 1)
+
+    self.handler.result_success = True
+    self.handler.raise_on_transfer = None
+    result = self.sync(policy_version=2)
+    self.assertIs(result.state, RoundState.COMMITTED)
+    self.assertEqual(dest.serving, expected_pattern(2))
+
+  def test_failed_transfer_leaves_destinations_serving(self):
+    dest = FakeDestination("sampler", [])
+    self.make_parallel(dest)
+    self.handler.result_success = False
+    self.handler.result_message = "planner produced no chunks"
+
+    self._assert_clean_transfer_failure_recovers(dest)
+
+  def test_raising_transfer_leaves_destinations_serving(self):
+    dest = FakeDestination("sampler", [])
+    self.make_parallel(dest)
+    self.handler.raise_on_transfer = RuntimeError("controller unreachable")
+
+    self._assert_clean_transfer_failure_recovers(dest)
+
+  def test_abort_on_unpaused_destination_is_accepted(self):
+    dest = FakeDestination("sampler", [])
+    self.make_parallel(dest)
+    self.handler.result_success = False
+
+    with self.assertRaises(WeightSyncError) as ctx:
+      self.sync()
+
+    # The abort closes the round on the worker without having touched
+    # serving state: the report reads "aborted", not unknown.
+    self.assertIn("abort", self.phases("sampler"))
+    self.assertEqual(dest.tracker.report()["phase"], "aborted")
+    self.assertEqual(
+        [w.phase for w in ctx.exception.result.workers], ["aborted"]
+    )
+
+  def test_abort_rpc_failure_after_unquiesced_transfer_does_not_poison(self):
+    dest = FakeDestination("sampler", [], fail_on="abort")
+    self.make_parallel(dest)
+    self.handler.result_success = False
+
+    with self.assertRaises(WeightSyncError) as ctx:
+      self.sync(policy_version=1)
+
+    self.assertIs(ctx.exception.result.state, RoundState.ABORTED)
+    self.assertTrue(
+        any("abort_weight_sync" in f for f in ctx.exception.result.failures)
+    )
+    self.assertIsNone(self.coordinator.poisoned)
+    self.assert_serving_untouched(dest)
+
+    self.handler.result_success = True
+    self.assertIs(self.sync(policy_version=2).state, RoundState.COMMITTED)
+
+  def test_timed_out_transfer_parks_unknown_as_with_flag_off(self):
+    dest = FakeDestination("sampler", [])
+    self.make_parallel(
+        dest,
+        timeouts=dataclasses.replace(FAST_TIMEOUTS, transfer=0.05),
+    )
+    self.handler.transfer_delay = 0.4
+
+    with self.assertRaises(WeightSyncError) as ctx:
+      self.sync()
+
+    self.assertIs(
+        ctx.exception.result.state, RoundState.UNKNOWN_TRANSFER_STATE
+    )
+    self.assertNotIn("abort", self.phases("sampler"))
+    self.assertNotIn("pre", self.phases("sampler"))
+    self.assertEqual(self.sources[0].release_calls, 0)
+    self.assertIsNotNone(self.coordinator.poisoned)
+
+  def test_outcome_unknown_parks_unknown_as_with_flag_off(self):
+    dest = FakeDestination("sampler", [])
+    self.make_parallel(dest)
+    self.handler.raise_on_transfer = weight_sync.TransferOutcomeUnknownError(
+        "coordinate_transfer timed out client-side"
+    )
+
+    with self.assertRaises(WeightSyncError) as ctx:
+      self.sync()
+
+    self.assertIs(
+        ctx.exception.result.state, RoundState.UNKNOWN_TRANSFER_STATE
+    )
+    self.assertNotIn("abort", self.phases("sampler"))
+    self.assertEqual(self.sources[0].release_calls, 0)
+    self.assertIsNotNone(self.coordinator.poisoned)
+
+  def test_pre_failure_after_transfer_rolls_back_like_flag_off(self):
+    d1 = FakeDestination("s1", [])
+    d2 = FakeDestination("s2", [], fail_on="pre", fail_persistently=True)
+    self.make_parallel(d1, d2)
+
+    with self.assertRaises(WeightSyncError) as ctx:
+      self.sync()
+
+    self.assertIs(ctx.exception.result.state, RoundState.ABORTED)
+    self.assertLess(self.log.index("transfer"), self.log.index("s1:pre"))
+    for wid, dest in (("s1", d1), ("s2", d2)):
+      self.assertIn("abort", self.phases(wid))
+      self.assertNotIn("sync", self.phases(wid))
+      self.assertEqual(dest.serving, [0.0] * 4)
+      self.assertTrue(dest.admitting)
+      self.assertTrue(dest.kv_cache)
+    self.assertIsNone(self.coordinator.poisoned)
+
+  def test_pre_failure_with_failed_abort_poisons_like_flag_off(self):
+    dest = FakeDestination(
+        "sampler", [], fail_on="pre", fail_persistently=True
+    )
+    self.make_parallel(dest)
+
+    # Abort also fails after a real quiesce: the destination may be stuck
+    # unserving, which is exactly when poisoning is right.
+    async def failing_abort(*args, **kwargs):
+      del args, kwargs
+      raise RuntimeError("abort failed")
+
+    dest.abort_weight_sync = failing_abort
+    with self.assertRaises(WeightSyncError) as ctx:
+      self.sync()
+
+    self.assertIs(
+        ctx.exception.result.state, RoundState.FAILED_NEEDS_RESTART
+    )
+    self.assertIsNotNone(self.coordinator.poisoned)
+
+  def test_pre_s_is_recorded_in_parallel_mode(self):
+    dest = FakeDestination(
+        "sampler", [], delay_after_phase="pre", delay_duration=0.05
+    )
+    self.make_parallel(dest)
+
+    result = self.sync()
+
+    self.assertGreater(result.phase_timings_s["pre"], 0.0)
 
 
 class PhaseTimeoutsEnvTest(absltest.TestCase):
