@@ -203,6 +203,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
   )
   parser.add_argument("--compute_logps_micro_batch_size", type=int, default=1)
   parser.add_argument("--compute_logps_chunk_size", type=int, default=0)
+  parser.add_argument(
+      "--logps_hoist_lm_head",
+      type=lambda v: str(v).strip().lower() in ("1", "true", "yes", "on"),
+      default=None,
+      help=(
+          "With --compute_logps_chunk_size > 0: gather the LM head once and"
+          " reduce its gradient once per loss call instead of per chunk."
+          " Unset leaves the loss default (env TUNIX_LOGPS_HOIST_LM_HEAD)."
+      ),
+  )
   parser.add_argument("--eval_every_n_steps", type=int, default=1000000)
   parser.add_argument(
       "--optimizer_opt_type",
@@ -893,6 +903,7 @@ def main(argv: list[str], context: Any = None) -> None:
       trainer_factory=trainer_factory,
       worker_id=args.worker_id,
       logps_chunk_size=args.compute_logps_chunk_size,
+      logps_hoist_lm_head=args.logps_hoist_lm_head,
       logps_micro_batch_size=args.compute_logps_micro_batch_size,
       execution_context=mesh,
   )
