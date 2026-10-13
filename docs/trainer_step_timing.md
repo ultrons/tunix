@@ -68,12 +68,20 @@ The error is bounded by the RPC's one-way latency asymmetry (milliseconds).
 The engine also logs the RPC returns, which were previously silent:
 
 ```
-train_step fwd_bwd RPC returned on actor worker in 14.812s (request_id=train_req_ab12cd34)
+train_step fwd_bwd RPC returned on actor worker in 14.812s (request_id=train_req_ab12cd34, apply_optimizer=False)
+train_step fwd_bwd RPC returned on actor worker in 41.020s (request_id=train_req_ef56ab78, apply_optimizer=True)
 train_step update RPC returned on actor worker in 0.412s (train_step=12)
 ```
 
 These are orchestrator-clock instants of the *dispatch* acknowledgements and
-complement the device-side instants above.
+complement the device-side instants above. With the fused final RPC
+(google/tunix#2719) the step's last `fwd_bwd` (`apply_optimizer=True`) runs the
+optimizer update inside the same RPC and, when the trainer exposes
+`last_update_token`, returns only once the update is ready on device, so its
+duration includes draining every in-flight microbatch plus the update. The
+separate `update RPC returned` line then appears only for workers without the
+fused update. In the `timing` snapshot, `update.dispatch_begin` follows the last
+`mb[i].dispatch_end` inside that same RPC.
 
 ## How readiness is observed without blocking
 
