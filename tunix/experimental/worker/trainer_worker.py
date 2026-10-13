@@ -46,6 +46,7 @@ class TrainerWorker(abstract_worker.Worker):
       *,
       worker_id: str = "trainer_worker",
       logps_chunk_size: int = 0,
+      logps_hoist_lm_head: bool | None = None,
       logps_micro_batch_size: int | None = None,
       execution_context: Any = None,
   ):
@@ -58,6 +59,10 @@ class TrainerWorker(abstract_worker.Worker):
         a context manager (e.g., a JAX Mesh) to enter during trainer
         initialization and worker method execution.
       logps_chunk_size: Optionally chunk the vocab (final-logits) computation.
+      logps_hoist_lm_head: With logps_chunk_size > 0, gather the LM head once
+        and reduce its gradient once per loss call instead of once per chunk
+        (`common.compute_chunked_logps_hoisted`). None leaves the loss's
+        default (env TUNIX_LOGPS_HOIST_LM_HEAD, off when unset).
       logps_micro_batch_size: Row chunk size for `per_token_logps`.
         If `None`, the whole request is scored in one forward.
     """
@@ -69,6 +74,7 @@ class TrainerWorker(abstract_worker.Worker):
         Callable[[Any], dict[str, Any]] | None
     ) = None
     self._logps_chunk_size = logps_chunk_size
+    self._logps_hoist_lm_head = logps_hoist_lm_head
     self._logps_micro_batch_size = logps_micro_batch_size
     self._is_running = False
     self._worker_id = worker_id
@@ -197,6 +203,8 @@ class TrainerWorker(abstract_worker.Worker):
       def _wrapped_gen_model_input_fn(payload: Any) -> dict[str, Any]:
         out = dict(orig_fn(payload))
         out.setdefault("compute_logps_chunk_size", chunk_size)
+        if self._logps_hoist_lm_head is not None:
+          out.setdefault("logps_hoist_lm_head", self._logps_hoist_lm_head)
         return out
 
       gen_model_input_fn = _wrapped_gen_model_input_fn
