@@ -860,6 +860,9 @@ def ppo_policy_loss_fn(
       segment_ids=getattr(train_example, "segment_ids", None),
       segment_positions=getattr(train_example, "segment_positions", None),
       chunk_size=kwargs.get("compute_logps_chunk_size", 0),
+      hoist_lm_head=kwargs.get(
+          "logps_hoist_lm_head", common.logps_hoist_lm_head_default()
+      ),
       return_moe_overflow=True,
       return_moe_audit=want_moe_audit,
   )
@@ -1162,6 +1165,9 @@ def grpo_loss_fn(
           segment_positions=getattr(train_example, "segment_positions", None),
           temperature=algo_config.temperature,
           chunk_size=kwargs.get("compute_logps_chunk_size", 0),
+          hoist_lm_head=kwargs.get(
+              "logps_hoist_lm_head", common.logps_hoist_lm_head_default()
+          ),
           routed_experts=getattr(train_example, "routed_experts", None),
           token_mask=token_mask,
           return_moe_overflow=True,
