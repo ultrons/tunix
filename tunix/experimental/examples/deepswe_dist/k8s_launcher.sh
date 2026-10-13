@@ -46,6 +46,8 @@ export TRAIN_MICRO_BATCH_SIZE=${TRAIN_MICRO_BATCH_SIZE:-1}
 export MAX_SEQ_TOKEN_PER_TPU=${MAX_SEQ_TOKEN_PER_TPU:-}
 export MAX_SEGMENTS_PER_PACKED_ROW=${MAX_SEGMENTS_PER_PACKED_ROW:-}
 export COMPUTE_LOGPS_CHUNK_SIZE=${COMPUTE_LOGPS_CHUNK_SIZE:-}
+# 1/true: gather the LM head once per loss call in the chunked log-prob pass (--logps_hoist_lm_head). Unset: off.
+export LOGPS_HOIST_LM_HEAD=${LOGPS_HOIST_LM_HEAD:-}
 
 # Set to tunix to run Tunix's PeftTrainer, and maxtext to run MaxText's MaxTextTrainingEngine
 export TRAINER_BACKEND=${TRAINER_BACKEND:-tunix}
@@ -697,6 +699,7 @@ start_trainer() {
         --num_generations=${NUM_GENERATIONS} \
         --train_micro_batch_size=${TRAIN_MICRO_BATCH_SIZE} \
         ${COMPUTE_LOGPS_CHUNK_SIZE:+--compute_logps_chunk_size=${COMPUTE_LOGPS_CHUNK_SIZE}} \
+        ${LOGPS_HOIST_LM_HEAD:+--logps_hoist_lm_head=${LOGPS_HOIST_LM_HEAD}} \
         --eval_every_n_steps=${EVAL_EVERY_N_STEPS} \
         --optimizer_b1=${ADAM_B1} \
         --optimizer_b2=${ADAM_B2} \

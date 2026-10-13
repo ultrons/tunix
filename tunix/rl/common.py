@@ -14,6 +14,7 @@
 """Common RL helper classes and functions."""
 
 import functools
+import os
 import re
 import inspect
 from typing import Any, Iterable, Sequence
@@ -494,6 +495,7 @@ def pop_moe_audit(model: nnx.Module) -> dict[str, jax.Array] | None:
         "chunk_size",
         "return_moe_overflow",
         "return_moe_audit",
+        "hoist_lm_head",
     ),
 )
 def compute_per_token_logps(
@@ -514,6 +516,7 @@ def compute_per_token_logps(
     token_mask: jax.Array | None = None,
     return_moe_overflow: bool = False,
     return_moe_audit: bool = False,
+    hoist_lm_head: bool = False,
 ) -> jax.Array | tuple[jax.Array, ...]:
   """Computes the per-token log probabilities.
 
@@ -546,6 +549,11 @@ def compute_per_token_logps(
       any MoE layer sowed a True `moe_has_overflow` intermediate (MaxText's
       RoutedMoE dropped tokens) during the forward pass. The model is merged
       inside this jit, so these intermediates are otherwise lost.
+    hoist_lm_head: with chunk_size > 0, computes the chunked LM head inside one
+      manual (shard_map) region with the head parameters replicated once on
+      entry, so the head weight is gathered once per call rather than once per
+      chunk, and its gradient is accumulated locally across chunks and reduced
+      once on exit. See `compute_chunked_logps_hoisted`.
 
   Returns:
     per_token_logps: jax.Array token-level logarithmic values.
@@ -640,7 +648,10 @@ def compute_per_token_logps(
 
   if chunk_size > 0:
     hidden_state = outputs[:, -logits_to_keep - 1 : -1, :]
-    out = compute_chunked_logps(
+    chunked_fn = (
+        compute_chunked_logps_hoisted if hoist_lm_head else compute_chunked_logps
+    )
+    out = chunked_fn(
         model,
         hidden_state,
         input_tokens_to_keep,
@@ -1002,6 +1013,246 @@ def compute_chunked_logps(
         :, :seq_len
     ]
     return per_token_logps
+
+
+LOGPS_HOIST_LM_HEAD_ENV = "TUNIX_LOGPS_HOIST_LM_HEAD"
+
+
+def logps_hoist_lm_head_default() -> bool:
+  """Default for `hoist_lm_head` when the caller does not pass one.
+
+  Read from the `TUNIX_LOGPS_HOIST_LM_HEAD` environment variable (1/true/yes/on)
+  of the process that traces the loss. Off when unset.
+  """
+  value = os.environ.get(LOGPS_HOIST_LM_HEAD_ENV, "")
+  return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _find_mesh(model) -> Any:
+  """The device mesh to run the hoisted LM head on.
+
+  The model's own `mesh` attribute (MaxText modules carry one; the Tunix
+  adapter's is on `.base`), else the ambient mesh. None if there is none.
+  """
+  for obj in (model, getattr(model, "base", None)):
+    mesh = getattr(obj, "mesh", None)
+    if isinstance(mesh, jax.sharding.Mesh):
+      return mesh
+  for _, node in nnx.iter_graph(model):
+    mesh = getattr(node, "mesh", None) if isinstance(node, nnx.Module) else None
+    if isinstance(mesh, jax.sharding.Mesh):
+      return mesh
+  abstract = jax.sharding.get_abstract_mesh()
+  if abstract is not None and not abstract.empty:
+    return abstract
+  from jax._src import mesh as mesh_lib  # pylint: disable=g-import-not-at-top
+  physical = mesh_lib.thread_resources.env.physical_mesh
+  return None if physical.empty else physical
+
+
+def _hidden_state_axes(mesh, batch: int, seq: int):
+  """Mesh axes for the batch and sequence dims of the [B, T, D] hidden states.
+
+  Greedy in mesh-axis order: an axis shards the batch if it divides what is
+  left of it, else the sequence, else the region is replicated over it (its
+  devices then compute the same values; autodiff accounts for that).
+  """
+  batch_axes, seq_axes = [], []
+  b_left, t_left = batch, seq
+  for name in mesh.axis_names:
+    size = mesh.shape[name]
+    if size == 1:
+      continue
+    if b_left % size == 0:
+      batch_axes.append(name)
+      b_left //= size
+    elif t_left % size == 0:
+      seq_axes.append(name)
+      t_left //= size
+  return tuple(batch_axes), tuple(seq_axes)
+
+
+def _lm_head_leaf_mask(graphdef, leaves, treedef, hidden_dim, dtype):
+  """Which flattened model-state leaves `compute_final_logits` reads.
+
+  Traces the head once on abstract values and dead-code-eliminates the jaxpr,
+  so the hoist replicates exactly the head's parameters (e.g. MaxText's
+  `logits_dense` kernel and `decoder_norm` scale, or the embedding table when
+  logits are tied to it) and nothing else.
+  """
+  from jax._src.interpreters import partial_eval as pe  # pylint: disable=g-import-not-at-top
+
+  def head(leaf_vals, hidden):
+    model = nnx.merge(graphdef, jtu.tree_unflatten(treedef, leaf_vals))
+    return model.compute_final_logits(hidden)
+
+  avals = [jax.ShapeDtypeStruct(jnp.shape(x), jnp.result_type(x)) for x in leaves]
+  closed = jax.make_jaxpr(head)(
+      avals, jax.ShapeDtypeStruct((1, 8, hidden_dim), dtype)
+  )
+  _, used = pe.dce_jaxpr(closed.jaxpr, [True] * len(closed.jaxpr.outvars))
+  return list(used[: len(leaves)])
+
+
+def compute_chunked_logps_hoisted(
+    model,
+    hidden_states,
+    target_ids,
+    temperature,
+    chunk_size,
+    return_entropy,
+):
+  """`compute_chunked_logps` with the LM head gathered once and reduced once.
+
+  Same results as `compute_chunked_logps` (up to accumulation order). In that
+  function the head is applied inside a `lax.scan` over sequence chunks to the
+  sharded (FSDP) head weight, so XLA gathers the weight inside every iteration
+  and, in the backward, reduces each chunk's partial weight gradient across the
+  batch shards inside every iteration as well.
+
+  Here the scan runs inside one `shard_map` over the mesh: the head's
+  parameters enter replicated (one all-gather each on entry), the hidden states
+  and targets enter sharded over batch / sequence, each device loops over its
+  own tokens in chunks of about the same per-device size as the unhoisted
+  path, and the parameters are cast to device-varying *before* the loop. That
+  last step puts the transpose of the replication (a psum of the parameter
+  cotangent) after the loop: the backward accumulates the head gradient
+  locally over all chunks and reduces it once.
+
+  Memory: one full copy of the head's parameters per device (for a
+  [4096, 248320] bf16 head, ~2 GB) plus its gradient accumulator in the
+  backward.
+
+  Args:
+    model: The actor model; must expose `compute_final_logits`.
+    hidden_states: [Batch, SeqLen, HiddenDim]
+    target_ids: [Batch, SeqLen]
+    temperature: Sampling temperature to divide the logits by.
+    chunk_size: Sequence chunk size of the unhoisted path; sets the number of
+      chunks, and so the per-device chunk size.
+    return_entropy: Also return the per-token entropy.
+
+  Returns:
+    per_token_logps [Batch, SeqLen] (and per_token_entropy [Batch, SeqLen]).
+  """
+  mesh = _find_mesh(model)
+  if mesh is None:
+    raise ValueError(
+        "hoist_lm_head needs a device mesh: none on the model (`mesh`) or in"
+        " context."
+    )
+  batch_size, seq_len, hidden_dim = hidden_states.shape
+  hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0.0)
+
+  pad_len = (chunk_size - (seq_len % chunk_size)) % chunk_size
+  if pad_len > 0:
+    hidden_states = jnp.pad(hidden_states, ((0, 0), (0, pad_len), (0, 0)))
+    target_ids = jnp.pad(target_ids, ((0, 0), (0, pad_len)))
+  padded_seq_len = seq_len + pad_len
+  num_chunks = padded_seq_len // chunk_size
+
+  batch_axes, seq_axes = _hidden_state_axes(mesh, batch_size, padded_seq_len)
+  varying_axes = batch_axes + seq_axes
+  unused = [
+      a for a in mesh.axis_names if mesh.shape[a] > 1 and a not in varying_axes
+  ]
+  if unused:
+    # The hidden states cannot be split over every mesh axis. That case gave a
+    # NaN upstream gradient on CPU (tests/rl/logps_hoist_lm_head_test.py), so
+    # it keeps the unhoisted path.
+    logging.warning(
+        "hoist_lm_head: mesh axes %s do not divide batch %d / padded sequence"
+        " %d; using the unhoisted chunked LM head.",
+        unused,
+        batch_size,
+        padded_seq_len,
+    )
+    return compute_chunked_logps(
+        model,
+        hidden_states[:, :seq_len],
+        target_ids[:, :seq_len],
+        temperature,
+        chunk_size,
+        return_entropy,
+    )
+  spec2 = jax.sharding.PartitionSpec(batch_axes or None, seq_axes or None)
+  spec3 = jax.sharding.PartitionSpec(batch_axes or None, seq_axes or None, None)
+
+  graphdef, state = nnx.split(model)
+  leaves, treedef = jtu.tree_flatten(state)
+  used = _lm_head_leaf_mask(
+      graphdef, leaves, treedef, hidden_dim, hidden_states.dtype
+  )
+  head_idx = [i for i, u in enumerate(used) if u]
+  head_vals = [leaves[i] for i in head_idx]
+  # Leaves the head does not read stay out of the manual region; abstract
+  # placeholders make any unexpected read fail loudly at trace time.
+  placeholders = [
+      jax.ShapeDtypeStruct(jnp.shape(x), jnp.result_type(x)) for x in leaves
+  ]
+  replicated = jax.sharding.PartitionSpec()
+
+  def body(head_local, hs_local, ids_local):
+    if varying_axes:
+      head_local = [
+          jax.lax.pcast(v, varying_axes, to="varying") for v in head_local
+      ]
+    vals = list(placeholders)
+    for i, v in zip(head_idx, head_local):
+      vals[i] = v
+    head_model = nnx.merge(graphdef, jtu.tree_unflatten(treedef, vals))
+
+    b, t, d = hs_local.shape
+    n = b * t
+    per_chunk = -(-n // num_chunks)
+    local_pad = per_chunk * num_chunks - n
+    hs_flat = hs_local.reshape(n, d)
+    ids_flat = ids_local.reshape(n)
+    if local_pad:
+      hs_flat = jnp.pad(hs_flat, ((0, local_pad), (0, 0)))
+      ids_flat = jnp.pad(ids_flat, ((0, local_pad),))
+    hs_chunks = hs_flat.reshape(num_chunks, 1, per_chunk, d)
+    ids_chunks = ids_flat.reshape(num_chunks, 1, per_chunk)
+
+    @jax.checkpoint
+    def logp_step(carry, xs):
+      hs_chunk, ids_chunk = xs
+      logits_chunk = head_model.compute_final_logits(hs_chunk).astype(
+          jnp.float32
+      )
+      if temperature != 0.0 and temperature != 1.0:
+        logits_chunk /= temperature
+      logps_chunk = selective_log_softmax(logits_chunk, ids_chunk)
+      if return_entropy:
+        return carry, (logps_chunk, compute_entropy_from_logits(logits_chunk))
+      return carry, (logps_chunk,)
+
+    _, outs = jax.lax.scan(logp_step, None, (hs_chunks, ids_chunks))
+    return tuple(o.reshape(num_chunks * per_chunk)[:n].reshape(b, t) for o in outs)
+
+  n_out = 2 if return_entropy else 1
+  if any(
+      t == jax.sharding.AxisType.Explicit
+      for t in getattr(mesh, "axis_types", ())
+  ):
+    # Explicitly sharded types must match the in_specs; reshard on entry (this
+    # is where the head is gathered).
+    def _to(spec):
+      if isinstance(mesh, jax.sharding.Mesh):
+        return jax.sharding.NamedSharding(mesh, spec)
+      return spec
+
+    head_vals = [jax.sharding.reshard(v, _to(replicated)) for v in head_vals]
+    hidden_states = jax.sharding.reshard(hidden_states, _to(spec3))
+    target_ids = jax.sharding.reshard(target_ids, _to(spec2))
+  outs = jax.shard_map(
+      body,
+      mesh=mesh,
+      in_specs=([replicated] * len(head_vals), spec3, spec2),
+      out_specs=(spec2,) * n_out,
+  )(head_vals, hidden_states, target_ids)
+  outs = tuple(o[:, :seq_len] for o in outs)
+  return outs if return_entropy else outs[0]
 
 
 @nnx.jit(static_argnames=("pad_id", "eos_id", "stop_gradient"))
