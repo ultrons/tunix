@@ -146,6 +146,18 @@ class HoistLmHeadTest(parameterized.TestCase):
     head_grad = [a for (p, a) in flat0 if "lm_head" in jax.tree_util.keystr(p)]
     self.assertGreater(float(np.max(np.abs(head_grad[0]))), 0.0)
 
+  def test_matches_chunked_reduce_scatter(self):
+    # TUNIX_LOGPS_HOIST_LM_HEAD_RS: the head enters sharded and is gathered
+    # inside the region (gradient reduce-scattered once); same numerics.
+    os.environ[common.LOGPS_HOIST_LM_HEAD_RS_ENV] = "1"
+    try:
+      self.assertTrue(common.logps_hoist_lm_head_rs_default())
+      self.test_matches_chunked_b4_fsdp4_ctx2()  # pytype: disable=attribute-error
+      self.test_matches_chunked_b2_fsdp4_ctx2()  # pytype: disable=attribute-error
+    finally:
+      os.environ.pop(common.LOGPS_HOIST_LM_HEAD_RS_ENV, None)
+    self.assertFalse(common.logps_hoist_lm_head_rs_default())
+
   def test_head_leaf_detection(self):
     model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
     graphdef, state = nnx.split(model)
