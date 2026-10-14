@@ -948,6 +948,14 @@ def compute_chunked_logps(
   hs_scannable = jnp.swapaxes(hs_reshaped, 0, 1)
   ids_scannable = jnp.swapaxes(ids_reshaped, 0, 1)
 
+  # A model may gather its output head once here (MaxText's adapter does under
+  # `grpo_logps_head_ag_once`), so the scan body reads a loop-invariant
+  # replicated head instead of gathering it per chunk, and the head gradient is
+  # accumulated across chunks and reduced once after the loop. Models without
+  # the hook, or with it switched off, return themselves.
+  if hasattr(model, "gather_output_head"):
+    model = model.gather_output_head()
+
   @nnx.remat
   def logp_step(carry, xs):
     hs_chunk, ids_chunk = xs
