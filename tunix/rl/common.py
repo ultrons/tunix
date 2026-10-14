@@ -1028,6 +1028,23 @@ def logps_hoist_lm_head_default() -> bool:
   return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+LOGPS_HOIST_LM_HEAD_RS_ENV = "TUNIX_LOGPS_HOIST_LM_HEAD_RS"
+
+
+def logps_hoist_lm_head_rs_default() -> bool:
+  """Whether the hoisted head enters sharded and is gathered inside the region.
+
+  Read from `TUNIX_LOGPS_HOIST_LM_HEAD_RS` (1/true/yes/on); off when unset. Only
+  matters with `hoist_lm_head`. With it, each head leaf whose first dim divides
+  over the hidden states' mesh axes enters the manual region sharded on that dim
+  and is all-gathered once inside it; the transpose of that gather is one
+  reduce-scatter of the head gradient in the params' dtype (bf16 for MaxText)
+  back onto the sharded layout, instead of an all-reduce of the full gradient.
+  """
+  value = os.environ.get(LOGPS_HOIST_LM_HEAD_RS_ENV, "")
+  return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _find_mesh(model) -> Any:
   """The device mesh to run the hoisted LM head on.
 
@@ -1191,11 +1208,32 @@ def compute_chunked_logps_hoisted(
       jax.ShapeDtypeStruct(jnp.shape(x), jnp.result_type(x)) for x in leaves
   ]
   replicated = jax.sharding.PartitionSpec()
+  # TUNIX_LOGPS_HOIST_LM_HEAD_RS: leaves whose first dim divides over the
+  # varying axes enter sharded on it and are gathered inside the region.
+  n_varying = int(np.prod([mesh.shape[a] for a in varying_axes])) if varying_axes else 1
+  scatter = [
+      logps_hoist_lm_head_rs_default()
+      and n_varying > 1
+      and jnp.ndim(v) >= 1
+      and jnp.shape(v)[0] % n_varying == 0
+      for v in head_vals
+  ]
+  head_specs = [
+      jax.sharding.PartitionSpec(varying_axes) if sc else replicated
+      for sc in scatter
+  ]
 
   def body(head_local, hs_local, ids_local):
     if varying_axes:
+      # A gathered leaf is the transpose-friendly path: all_gather's transpose
+      # is a psum_scatter of the gradient, done once after the loop, in the
+      # leaf's dtype. The others are replicated and cast to device-varying, so
+      # their gradient is psum'd once after the loop.
       head_local = [
-          jax.lax.pcast(v, varying_axes, to="varying") for v in head_local
+          jax.lax.all_gather(v, varying_axes, axis=0, tiled=True)
+          if sc
+          else jax.lax.pcast(v, varying_axes, to="varying")
+          for v, sc in zip(head_local, scatter)
       ]
     vals = list(placeholders)
     for i, v in zip(head_idx, head_local):
@@ -1242,13 +1280,13 @@ def compute_chunked_logps_hoisted(
         return jax.sharding.NamedSharding(mesh, spec)
       return spec
 
-    head_vals = [jax.sharding.reshard(v, _to(replicated)) for v in head_vals]
+    head_vals = [jax.sharding.reshard(v, _to(sp)) for v, sp in zip(head_vals, head_specs)]
     hidden_states = jax.sharding.reshard(hidden_states, _to(spec3))
     target_ids = jax.sharding.reshard(target_ids, _to(spec2))
   outs = jax.shard_map(
       body,
       mesh=mesh,
-      in_specs=([replicated] * len(head_vals), spec3, spec2),
+      in_specs=(head_specs, spec3, spec2),
       out_specs=(spec2,) * n_out,
   )(head_vals, hidden_states, target_ids)
   outs = tuple(o[:, :seq_len] for o in outs)
