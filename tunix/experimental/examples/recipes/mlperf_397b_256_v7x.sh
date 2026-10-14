@@ -135,8 +135,10 @@ export REMAT_POLICY="${REMAT_POLICY:-custom}"
 export RAGGED_BUFFER_FACTOR="${RAGGED_BUFFER_FACTOR:-2.0}"
 export REMAT_CONTEXT="${REMAT_CONTEXT:-remat}"
 export NUM_MOE_TOKEN_CHUNKS="${NUM_MOE_TOKEN_CHUNKS:-2}"
+# GDN context-parallel sharding: head (default) or seq.
+export GDN_CP_MODE="${GDN_CP_MODE:-head}"
 export MAXTEXT_EXTRA_FLAGS="${MAXTEXT_EXTRA_FLAGS:-custom_mesh_and_rule=cp-as-ep \
-use_gdn_kernel=true gdn_cp_mode=head gdn_chunk_size=64 \
+use_gdn_kernel=true gdn_cp_mode=${GDN_CP_MODE} gdn_chunk_size=64 \
 decoder_layer_input=offload context=${REMAT_CONTEXT} gdn=remat gdn_conv=remat gdn_states=remat \
 megablox=true sparse_matmul=true use_tokamax_gmm=true use_gmm_v2=true \
 use_gmm_v2_heuristic_tiling=false merge_gating_gmm=false \
