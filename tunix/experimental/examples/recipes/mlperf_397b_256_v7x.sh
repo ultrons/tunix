@@ -191,6 +191,12 @@ fi
 if [[ "${LOG_MOE_DROPS:-false}" == "true" ]]; then
   export MAXTEXT_EXTRA_FLAGS="${MAXTEXT_EXTRA_FLAGS} log_moe_drops=true"
 fi
+# MAXTEXT_APPEND_FLAGS: extra MaxText key=value flags appended verbatim after the
+# trainer flags above. MaxText keeps the last value of a repeated key, so this also
+# overrides keys that have no knob of their own (e.g. sa_fuse_reciprocal=true).
+if [[ -n "${MAXTEXT_APPEND_FLAGS:-}" ]]; then
+  export MAXTEXT_EXTRA_FLAGS="${MAXTEXT_EXTRA_FLAGS} ${MAXTEXT_APPEND_FLAGS}"
+fi
 export DEBUG=${DEBUG:-0}
 
 # DeepSWE Environment & Agent Sandbox
