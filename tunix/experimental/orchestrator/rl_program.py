@@ -404,6 +404,7 @@ class StandardRLProgram(RLProgram):
       initial_dispatch_stagger_s: float = 0.0,
       initial_dispatch_first_stagger_s: float | None = None,
       trainer_warmup_payload: datatypes.RLTrainerPayload | None = None,
+      stage_train_batches: bool | None = None,
   ):
     super().__init__()
     self.engine: rl_engine_interface.AbstractRLEngine | None = None
@@ -520,6 +521,16 @@ class StandardRLProgram(RLProgram):
     # trainer compute. At most one train_step is ever outstanding, so the
     # gradient-accumulation order is unchanged.
     self.pipeline_train_microbatches = pipeline_train_microbatches
+    # Sends each micro-batch to the trainer in a `stage_batch` RPC before
+    # awaiting the previous micro-batch's train_step, so its host-to-device
+    # transfer overlaps that micro-batch's compute; the train_step then
+    # carries only the staged key. None reads the trainer's own knob,
+    # TUNIX_STAGE_BATCH=stage, from this process's env (off when unset).
+    if stage_train_batches is None:
+      stage_train_batches = os.environ.get(
+          "TUNIX_STAGE_BATCH", ""
+      ).strip().lower() in ("1", "true", "yes", "on", "stage")
+    self.stage_train_batches = bool(stage_train_batches)
     self._pending_train: asyncio.Task[tuple[Any, float]] | None = None
     # A cancelled asyncio.to_thread leaves its worker running, so the error
     # path's reset() must wait for any in-flight feed/flush to finish.
@@ -1796,17 +1807,35 @@ class StandardRLProgram(RLProgram):
     await asyncio.to_thread(_locked)
 
   async def _timed_train_step(
-      self, batch: datatypes.RLTrainerPayload, *, apply_optimizer: bool
+      self,
+      batch: datatypes.RLTrainerPayload | None,
+      *,
+      apply_optimizer: bool,
+      stage_key: str | None = None,
   ) -> tuple[Any, float]:
     assert self.engine is not None
     start = time.monotonic()
+    # With a staged key the trainer already holds the micro-batch (see
+    # `_stage_train_batch`), so the request ships no payload.
+    extra = {"stage_key": stage_key} if stage_key is not None else {}
     result = await self.engine.train_step(
         batch,
         role=datatypes.Role.ACTOR,
         accumulate_gradients=True,
         apply_optimizer=apply_optimizer,
+        **extra,
     )
     return result, time.monotonic() - start
+
+  async def _stage_train_batch(
+      self, batch: datatypes.RLTrainerPayload
+  ) -> str | None:
+    """Stages `batch` on the trainer (`stage_train_batches`); None if it was not staged."""
+    assert self.engine is not None
+    stager = getattr(self.engine, "stage_train_batch", None)
+    if stager is None:
+      return None
+    return await stager(batch, role=datatypes.Role.ACTOR)
 
   async def _log_trainer_step_timing(self, step: int) -> None:
     """Logs `TRAINER_STEP_TIMING` for `step` (one line, machine-readable).
@@ -2167,9 +2196,21 @@ class StandardRLProgram(RLProgram):
                 "First trainer micro-batch: %s",
                 batch_assembly.describe_payload(batch),
             )
+          stage_key = None
+          if self.stage_train_batches:
+            # Before awaiting the previous micro-batch's train_step: the
+            # trainer serves this RPC off its event loop and issues the
+            # transfer while that micro-batch computes. The step's first
+            # micro-batch has nothing to hide behind here (its transfer is
+            # exposed in this RPC, but no longer contends with the second
+            # micro-batch's); staging it during the previous step's last
+            # micro-batch / weight sync is the open follow-up.
+            stage_key = await self._stage_train_batch(batch)
           await _await_pending_train()
           train_step = self._timed_train_step(
-              batch, apply_optimizer=is_final_batch
+              None if stage_key is not None else batch,
+              apply_optimizer=is_final_batch,
+              stage_key=stage_key,
           )
           batch = None
           if self.pipeline_train_microbatches and not is_final_batch:

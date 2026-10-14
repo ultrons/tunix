@@ -39,6 +39,7 @@ import collections
 import concurrent.futures
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import inspect
 import pickle
@@ -582,6 +583,16 @@ class RemoteExecutionServer(abc.ABC):
     self._response_queue_loop: Optional[asyncio.AbstractEventLoop] = None
     self._request_counter: int = 0
     self._background_tasks: set[asyncio.Task[Any]] = set()
+    # Lazily built thread pool for the instance's `remote_executor_methods`
+    # (see `execute_request`).
+    self._method_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+  def _method_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+    if self._method_pool is None:
+      self._method_pool = concurrent.futures.ThreadPoolExecutor(
+          max_workers=2, thread_name_prefix="rpc-method"
+      )
+    return self._method_pool
 
   def _get_response_queue(self) -> asyncio.Queue[ExecutionResponse]:
     """Returns the response queue bound to the currently running event loop."""
@@ -726,6 +737,18 @@ class RemoteExecutionServer(abc.ABC):
     try:
       if inspect.iscoroutinefunction(method):
         result = await method(*request.args, **request.kwargs)
+      elif target_name in getattr(
+          self._instance, "remote_executor_methods", ()
+      ):
+        # A sync method the instance asks to run off the event loop (e.g.
+        # TrainerWorker.stage_batch, and fwd_bwd under TUNIX_STAGE_BATCH=stage),
+        # so the loop keeps serving while it blocks. Two pool threads: a stage
+        # call must be served while a fwd_bwd blocks; the instance orders its
+        # own state access (the orchestrator never has two fwd_bwd in flight).
+        result = await asyncio.get_running_loop().run_in_executor(
+            self._method_executor(),
+            functools.partial(method, *request.args, **request.kwargs),
+        )
       else:
         result = method(*request.args, **request.kwargs)
       return ExecutionResponse(result=result, request_id=request.request_id)

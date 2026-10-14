@@ -16,6 +16,7 @@
 
 from collections.abc import Mapping
 import contextlib
+import os
 import threading
 import time
 from typing import Any, Callable, ContextManager, cast
@@ -36,6 +37,16 @@ WorkerState = datatypes.WorkerState
 
 
 STEP_TIMING_SCHEMA_VERSION = 1
+
+# Same env as MaxText's `maxtext_engine.stage_batch_mode`: `stage` (1/true/yes/
+# on/stage) lets a caller `stage_batch` a micro-batch ahead of its `fwd_bwd`.
+STAGE_BATCH_ENV = "TUNIX_STAGE_BATCH"
+
+
+def stage_batch_env_on() -> bool:
+  """Whether `TUNIX_STAGE_BATCH` selects the `stage` mode (off when unset)."""
+  value = os.environ.get(STAGE_BATCH_ENV, "").strip().lower()
+  return value in ("1", "true", "yes", "on", "stage")
 
 
 class StepTimer:
@@ -230,6 +241,16 @@ class TrainerWorker(abstract_worker.Worker):
     self._last_error: str | None = None
     self._step_timer = StepTimer()
     self._missing_timing_tokens: set[str] = set()
+    # Methods the RPC server runs on its executor thread rather than on the
+    # event loop (remote_execution.RemoteExecutionServer.execute_request):
+    # `stage_batch` always (issuing a transfer can block for seconds), and
+    # `fwd_bwd` under TUNIX_STAGE_BATCH=stage, so a stage RPC is handled while
+    # a fwd_bwd blocks (on the previous micro-batch's overflow flag, or on the
+    # update at the step's end). With the env unset, fwd_bwd stays on the loop
+    # as before and nothing calls stage_batch.
+    self.remote_executor_methods: frozenset[str] = frozenset(
+        {"stage_batch"} | ({"fwd_bwd"} if stage_batch_env_on() else set())
+    )
 
   def _policy_version(self) -> int:
     if self._trainer is None:
@@ -452,6 +473,35 @@ class TrainerWorker(abstract_worker.Worker):
       self._last_error = str(exc)
       self.state = WorkerState.ERROR
       raise
+
+  def stage_batch(
+      self, request: datatypes.TrainRequest, **kwargs: Any
+  ) -> datatypes.Response:
+    """Transfers a micro-batch's inputs onto the devices ahead of its `fwd_bwd`.
+
+    Forwards to the trainer's `stage_batch(payload, key=request.request_id)`
+    (MaxText's engine under `TUNIX_STAGE_BATCH=stage`): the transfer is issued
+    now and overlaps whatever the trainer is computing, and the `fwd_bwd` whose
+    `stage_key` (or batch structure) matches consumes it instead of transferring
+    its own inputs. A trainer without `stage_batch`, or one with staging off,
+    stages nothing and the response says so (`staged=False`); `fwd_bwd` then
+    transfers as before. Stays off the trainer's step path: no state change, no
+    step timing. Marked to run on the RPC server's executor thread, so a
+    blocking `fwd_bwd` on the event loop does not hold it back.
+    """
+    self._ensure_ready()
+    del kwargs
+    stager = getattr(self._trainer, "stage_batch", None)
+    if not callable(stager):
+      return self._response(staged=False, reason="trainer has no stage_batch")
+    try:
+      staged = bool(stager(request.payload, key=request.request_id))
+    except Exception as exc:
+      self._last_error = str(exc)
+      raise
+    resp = self._response(staged=staged)
+    resp.request_id = request.request_id
+    return resp
 
   def update(self, **kwargs) -> int:
     """Applies the accumulated (mean) gradients as one optimizer update."""

@@ -926,6 +926,50 @@ class DistributedRLEngine(rl_engine_interface.AbstractRLEngine):
           "update_ready": update_ready,
       }
 
+  async def stage_train_batch(
+      self,
+      payload: datatypes.RLTrainerPayload,
+      role: datatypes.Role = datatypes.Role.ACTOR,
+  ) -> str | None:
+    """Stages a micro-batch's inputs on the trainer ahead of its `train_step`.
+
+    Sends a `stage_batch` RPC (TrainerWorker.stage_batch, which the worker runs
+    off its event loop) carrying the payload; the trainer transfers it onto the
+    devices now, overlapping whatever it computes. Returns the request id to
+    pass as `train_step(None, stage_key=...)`, which then ships no payload and
+    runs the staged one, or None when the trainer did not stage it (no
+    `stage_batch` on the worker or its trainer, or `TUNIX_STAGE_BATCH` unset
+    there), in which case the caller sends `train_step(payload)` as usual.
+    """
+    worker = self._trainer_workers.get(role)
+    if worker is None:
+      raise ValueError(f"No trainer worker registered for role {role}")
+    request = datatypes.TrainRequest(
+        request_id=f"stage_req_{uuid.uuid4().hex[:8]}",
+        payload=payload,
+        metadata=dict(getattr(payload, "metadata", {}) or {}),
+    )
+    t_rpc = time.monotonic()
+    try:
+      result = await self._invoke_worker(worker, "stage_batch", request=request)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      # An older worker without the method, or a trainer that refused: the
+      # micro-batch is sent with its train_step as before.
+      logging.warning("stage_batch RPC failed on the trainer (%r)", exc)
+      return None
+    staged = bool(
+        isinstance(result, datatypes.Response)
+        and isinstance(result.metadata, Mapping)
+        and result.metadata.get("staged")
+    )
+    logging.info(
+        "stage_batch RPC returned in %.3fs (request_id=%s, staged=%s)",
+        time.monotonic() - t_rpc,
+        request.request_id,
+        staged,
+    )
+    return request.request_id if staged else None
+
   async def get_step_timing(
       self, role: datatypes.Role = datatypes.Role.ACTOR
   ) -> tuple[dict[str, Any] | None, float]:
