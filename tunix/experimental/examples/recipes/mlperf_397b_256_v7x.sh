@@ -261,11 +261,11 @@ fi
 # 107.59 -> 106.24 s/step; grad_norm moved 1.5e-5 relative, less than a rerun (1.9e-5).
 if [[ "${TRAINER_TUNED_FLAGS:-false}" == "true" ]]; then
   export MAXTEXT_EXTRA_FLAGS="${MAXTEXT_EXTRA_FLAGS} context_parallel_strategy=all_gather sa_fuse_reciprocal=true gdn_cp_mode=seq gdn_cp_state=device gdn_cp_matmul_precision=high cast_grads_after_all_reduce=true wi_tile_dlhs_mlp_dim=2048 decoder_layer_input=device moe_route=device prepare_moe_weights_once_per_step=true moe_roe_packed_routing_gather=true gdn_conv1d_input_in_qkv_dtype=true wi_tile_fwd_batch_seq=512 wi_tile_drhs_batch_seq=512 wo_tile_fwd_batch_seq=512 wo_tile_dlhs_batch_seq=512 wo_tile_drhs_batch_seq=512"
-  if [[ "${TRAINER_TPU_SLICE}" == "tpu7x:4x8x8" ]]; then
+  if [[ "${TRAINER_TPU_SLICE}" == "tpu7x:4x8x8" && "${TRAINER_MESH_EXPERT}" == "1" ]]; then
+    # One MoE token chunk (64x1x8): no chunk pipeline. moe_roe_packed_routing_gather=true (above) requires
+    # moe_chunk_pipeline=true, so a multi-chunk 256-chip mesh (e.g. 64x2x4) keeps the base recipe's pipeline.
     export MAXTEXT_EXTRA_FLAGS="${MAXTEXT_EXTRA_FLAGS} moe_chunk_pipeline=false"
-    if [[ "${TRAINER_MESH_EXPERT}" == "1" ]]; then
-      export MAXTEXT_EXTRA_FLAGS="${MAXTEXT_EXTRA_FLAGS} query_proj=device key_proj=device value_proj=device out_proj=device qkv_proj=device"
-    fi
+    export MAXTEXT_EXTRA_FLAGS="${MAXTEXT_EXTRA_FLAGS} query_proj=device key_proj=device value_proj=device out_proj=device qkv_proj=device"
   fi
 fi
 export DEBUG=${DEBUG:-0}
